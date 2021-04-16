@@ -16,215 +16,333 @@ from mpl_toolkits.mplot3d import Axes3D
 from meshplot import plot, subplot, interact
 import meshplot
 
-def filter_preprocessed_meshes(output_folder, max_num_faces = 9000):
+def tri_to_str(tri):
+    return "{}.{}.{}".format(tri[0], tri[1], tri[2])
+
+def str_to_tri(tri_string):
+    return [int(num) for num in re.findall('(\d+)\.(\d+)\.(\d+)', tri_string)[0]]
+
+def process_mesh(mesh_file, output_folder):
     """
-    Takes the output folder from preprocess_meshes() and performs the following operations.
-    1) Removes all meshes with more than the maximum number of faces.
-    2) Pads all meshes to be (max_num_faces by 7 by 11)
-    3) TODO Normalizes per each of the 11 features per mesh
-    :param output_folder: string path to output folder containing preprocessed meshes
-    :param max_num_faces: int, maximum number of faces per mesh
-    :return: None
+    We define a neighbourhood as a face and its two coincident tets. Each
+    neighbourhood is comprised of 7 faces with 5 vertices. Faces on the surface
+    of the tetmesh have only a single tet in this case 4 faces and 4 vertices.
+    We uniquely order the vertices as v0, v1, v2, pole0 and pole1. The ordering
+    of v0, v1, v2 is determined by angle (largest to smallest). Poles are ordered
+    by distance to the triangle defined by v0, v1, v2.
+
+    Takes each mesh and produces two relevant datastructures.
+    1) Features:
+        A [# faces, 12] sized tensor with 12 face-based features. The features are:
+        - 3 acute angles of the triangular face               : a0, a1, a2
+        - 3 acute angles of pole0                             : a3, a4, a5
+        - 3 acute angles of pole1                             : a6, a7, a8
+        - 1 triangle-pole0 distance squared over triangle area: p0
+        - 1 triangle-pole1 distance squared over triangle area: p1
+        - 1 area of the triangle                              : area
+        They are arranged as a 1 by 12 vector per face in the order above. For surface
+        meshes, a6, a7, a8 are 0 and p1 is 0.
+
+    2) Adjacency:
+        A [# faces, 7] sized tensor with values denoting indices of adjacent faces.
+        Each row denotes the idx of the face into the features array and the indices
+        of its 6 neighbours. For surface faces, the last 3 neighbours are -1.
+    :param mesh_file: .msh file containing the tet-mesh (ex: 00001.msh)
+    :param output_folder: file in which to write the two datastructures (ex: 0001f.msh, 00001a.msh)
+    :return:
     """
-    processed_meshes = [join(output_folder, f) for f in listdir(output_folder)
-                        if (isfile(join(output_folder, f)) and f[-3:] == ".pt")]
+    start = time.time()
+    tri_idx_map = {}
+    idx_tri_map = {}
 
-    for processed_mesh in processed_meshes:
-        tensor = torch.load(processed_mesh)
-        num_faces = tensor.shape[0]
-        print("Padding mesh with " + str(num_faces) + " faces.")
-        if num_faces > 9000:
-            # Mark mesh as too large
-            os.rename(processed_mesh, processed_mesh + ".x")
+    def str_to_idx(tri_str):
+        if tri_str == "x":
+            return -1
 
-        else:
-            # Pad mesh and resave it
-            res = torch.zeros(max_num_faces, 7, 11)
-            res[0:num_faces, :, :] = tensor
-            os.remove(processed_mesh)
-            torch.save(res, processed_mesh)
+        t = str_to_tri(tri_str)
+        for p in set(permutations(t)):
+            tri_str = tri_to_str(p)
+            if tri_str in tri_idx_map:
+                return tri_idx_map[tri_str]
 
-def preprocess_meshes(meshes, output_folder):
-    """
-    Takes a list of .msh files and for each mesh calculates its features and saves its
-    (# faces by 7 by 11) local patch features tensor to an output folder. Assumes .msh files are
-    named "XXXXX.msh" where X is in [0-9].
-    :param meshes: list of .msh files to process
-    :param output_folder: path to folder where processed mesh tensors are saved
-    :return: none
-    """
+    def idx_to_str(ix):
+        return idx_tri_map[ix]
 
-    for mesh in meshes:
-        start = time.time()
-        mesh_id = mesh[-9:-4]
+    # Read .msh file to get verts and tets
+    verts, tets = igl.read_msh(mesh_file)
 
-        print("Processing mesh " + mesh_id)
-        verts, tets = igl.read_msh(mesh)
-        tris, tri_tet_dict = get_triangles_and_index(tets)
-        features = calculate_element_features(tris, verts, tets, tri_tet_dict)
-        end = time.time()
+    # Indices into each tet to get 4 composite triangles
+    i0 = [0, 1, 2]
+    i1 = [0, 1, 3]
+    i2 = [0, 2, 3]
+    i3 = [1, 2, 3]
+    poles = [3, 2, 1, 0]
 
-        features_tensor = torch.from_numpy(features)
-        torch.save(features_tensor, output_folder + "\\" + mesh_id + ".pt")
+    # Track triangles' vertices and angles
+    tri_seen = set()
+    tri_features = []
+    tri_adjacency = []
 
-        print("Processing time for mesh " + mesh_id + ": " + str(end - start))
-        print("Output shape for mesh " + mesh_id + ": " + str(features.shape))
-        print("---------------------------------------------------------")
+    for i in range(len(tets)):
+        tet = tets[i]
+        tris = [tet[i0], tet[i1], tet[i2], tet[i3]]
 
+        for j in range(len(tris)):
+            tri = tris[j]
 
-def calculate_element_features(tris, verts, tets, tri_tet_dict):
-    """
-    Each element is defined as a triangle face and its two conjoining tets. The vertices farthest
-    from the triangular face are "poles".
+            seen_before = False
+            tri_string = ""
+            for perm in set(permutations(tri)):
+                tri_string = tri_to_str(perm)
+                if tri_string in tri_seen:
+                    seen_before = True
+                    break
 
-    CALCULATE FEATURES PER FACE:
-    Given the tris, verts and tets in a mesh, calculate the following features per element:
-    1) The 3 acute angles of the triangle itself (3 in total):
-        Order by angle size, these vertices are numbered 1, 2, 3 respectively.
-    2) The 3 acute angles of each pole (6 in total)
-        Order first by farthest pole from vertex 1 and then by angle towards 1-2 edge, 2-3 edge and then 3-1 edge.
-    3) The ratio of the perpendicular distance from each pole to the triangle face squared over the area
-       of the triangle. (2 in total)
-        Order by the farthest pole from vertex 1.
-    Edge faces are padded with zeros.
+            if not seen_before:
+                # Calculate ordering of vertices and angles in tri
+                v0, v1, v2, a0, a1, a2 = calc_ordered_angles(tri, verts)
+                # Calculate pole distance
+                pole = tet[poles[j]]
+                pole_dist = calc_point_tri_distance(pole, tri, verts)
 
-    GROUP FACES INTO LOCAL PATCHES:
-    Then group elements by their local patches (1 central face and 6 neighbouring faces).
-        Order by 1-2-p0, 2-3-p0, 3-1-p0, 1-2-p1, 2-3-p1, 3-1-p1
+                # Calculate triangle area
+                area = calc_tri_area(verts[v0], verts[v1], verts[v2])
 
-    :param tris: numpy ndarray of size (# tris, 3) containing all triangles in the mesh.
-    :param verts: numpy ndarray of size (# verts, 3) containing all vertices in the mesh.
-    :param tets: numpy ndarray of size (# tets, 4) containing all tets in the mesh.
-    :param tets: dictionary of format {tri_id: [tet_idx0, tet_idx1]} - a triangle id and its two coincident tets
-    :return: A size (# faces by # neighbours by 11) numpy array containing the features per each element.
-    """
-    all_features = {}
-    all_neighbours = {}
+                # Calculate pole distance feature
+                pole_dist_feature = pole_dist ** 2 / area
 
-    # Every triangle in the mesh represents an element
-    for tri_id in tri_tet_dict:
-        # Get triangle vertex indices
-        tri_vert_idxs = np.array(id_to_triangle(tri_id))
+                # Calculate pole angles
+                a3 = calc_angle_in_tri(verts[pole], verts[v0], verts[v1])
+                a4 = calc_angle_in_tri(verts[pole], verts[v1], verts[v2])
+                a5 = calc_angle_in_tri(verts[pole], verts[v2], verts[v0])
 
-        # Get pole vertex indices
-        tet0_idx = tri_tet_dict[tri_id][0]
-        tet1_idx = tri_tet_dict[tri_id][1]
-        pole0_idx = -1
-        pole1_idx = -1
+                # Set tri_string to idx maps
+                idx = len(tri_features)
+                tri_string = tri_to_str([v0, v1, v2])
+                tri_idx_map[tri_string] = idx
+                idx_tri_map[idx] = tri_string
 
-        for vert_idx in tets[tet0_idx]:
-            if vert_idx in tri_vert_idxs:
-                continue
-            pole0_idx = vert_idx
-        if tet1_idx != -1:
-            for vert_idx in tets[tet1_idx]:
-                if vert_idx in tri_vert_idxs:
-                    continue
-                pole1_idx = vert_idx
+                # Update tri_features
+                tri_features.append([a0, a1, a2,
+                                     a3, a4, a5,
+                                     0, 0, 0,
+                                     pole_dist_feature, 0, area])
 
-        # Get triangle vertices
-        tri_verts = np.array([verts[tri_vert_idxs[0]], verts[tri_vert_idxs[1]], verts[tri_vert_idxs[2]]])
+                # Update tri_adjacency
+                tri_adjacency.append([
+                    tri_to_str([v0, v1, v2]),
+                    tri_to_str([pole, v0, v1]),
+                    tri_to_str([pole, v1, v2]),
+                    tri_to_str([pole, v2, v0]),
+                    "x",
+                    "x",
+                    "x"
+                ])
 
-        # Calculate triangle face's angles
-        tri_angles = np.array(tri_calc_angles(tri_verts[0], tri_verts[1], tri_verts[2]))
-
-        # Get ordering by angle magnitudes
-        ordering = np.argsort(tri_angles)
-
-        # Order triangle vertices and indexes
-        ordered_tri_verts = tri_verts[ordering]
-        ordered_tri_verts_idxs = tri_vert_idxs[ordering]
-        ordered_tri_angles = tri_angles[ordering]
-
-        v0, v1, v2 = ordered_tri_verts
-        v0_idx, v1_idx, v2_idx = ordered_tri_verts_idxs
-
-        # Get pole vertices and order them
-        pole0, pole1 = -1, -1
-        pole0_dist_sqr, pole1_dist_sqr = 0, 0
-        if pole1_idx == -1:
-            pole0 = verts[pole0_idx]
-        else:
-            pole0 = verts[pole0_idx]
-            pole1 = verts[pole1_idx]
-            pole0_dist_sqr = dist_sqr(pole0, v0)
-            pole1_dist_sqr = dist_sqr(pole1, v0)
-
-            if pole1_dist_sqr > pole0_dist_sqr:
-                pole0_idx, pole1_idx = pole1_idx, pole0_idx
-                pole0, pole1 = pole1, pole0
-                pole0_dist_sqr, pole1_dist_sqr = pole1_dist_sqr, pole0_dist_sqr
-
-        # Calculate pole angles
-        ordered_pole_angles = np.zeros(6)
-        if pole1_idx == -1: # edge face
-            ordered_pole_angles[0] = tri_calc_angle(pole0, v0, v1)
-            ordered_pole_angles[1] = tri_calc_angle(pole0, v1, v2)
-            ordered_pole_angles[2] = tri_calc_angle(pole0, v2, v0)
-        else:
-            ordered_pole_angles[0] = tri_calc_angle(pole0, v0, v1)
-            ordered_pole_angles[1] = tri_calc_angle(pole0, v1, v2)
-            ordered_pole_angles[2] = tri_calc_angle(pole0, v2, v0)
-            ordered_pole_angles[3] = tri_calc_angle(pole1, v0, v1)
-            ordered_pole_angles[4] = tri_calc_angle(pole1, v1, v2)
-            ordered_pole_angles[5] = tri_calc_angle(pole1, v2, v0)
-
-        # Calculate pole length ratios
-        tri_area = tri_calc_area(v0, v1, v2)
-        r0 = pole0_dist_sqr / tri_area
-        r1 = pole1_dist_sqr / tri_area
-
-        # Assemble feature vector for this face
-        features = np.hstack([ordered_tri_angles, ordered_pole_angles, r0, r1])
-        all_features[tri_id] = features
-
-        # Get neighbours in local patch for this face
-        t0 = [v0_idx, v1_idx, v2_idx]
-        t1 = [v0_idx, v1_idx, pole0_idx]
-        t2 = [v1_idx, v2_idx, pole0_idx]
-        t3 = [v2_idx, v0_idx, pole0_idx]
-        t4 = -1 # Nonexistent neighbouring faces for a face on the edge of the mesh
-        t5 = -1
-        t6 = -1
-        if pole1_idx != -1:
-            t4 = [v0_idx, v1_idx, pole1_idx]
-            t5 = [v1_idx, v2_idx, pole1_idx]
-            t6 = [v2_idx, v0_idx, pole1_idx]
-        ordered_neighbours = [t0, t1, t2, t3, t4, t5, t6]
-        all_neighbours[tri_id] = ordered_neighbours
-
-    # Use all_features and all_neighbours to generate result
-    res = []
-    for tri_id in all_neighbours:
-        patch = all_neighbours[tri_id]
-
-        patch_features = []
-        for tri in patch:
-            if tri != -1:
-                for perm in set(permutations(tri)):
-                    _tri_id = triangle_to_id(perm)
-                    if _tri_id in all_features:
-                        patch_features.append(all_features[_tri_id])
-                        break
+                # Add to seen
+                tri_seen.add(tri_string)
             else:
-                patch_features.append([0]*11) # Pad with zeros
+                # Get ordered triangle vertices
+                v0, v1, v2 = str_to_tri(tri_string)
 
-        res.append(patch_features)
+                # Calculate pole distance
+                pole = tet[poles[j]]
+                pole_dist = calc_point_tri_distance(pole, [v0, v1, v2], verts)
 
-    return np.array(res)
+                # Calculate pole angles
+                a3 = calc_angle_in_tri(verts[pole], verts[v0], verts[v1])
+                a4 = calc_angle_in_tri(verts[pole], verts[v1], verts[v2])
+                a5 = calc_angle_in_tri(verts[pole], verts[v2], verts[v0])
 
-def tri_calc_angles(a, b, c):
+                # Get already calculated features
+                idx = tri_idx_map[tri_string]
+
+                area = tri_features[idx][11]
+                pole_dist_feature0 = tri_features[idx][9]
+                pole_dist_feature1 = pole_dist ** 2 / area
+
+                # Check if we need to swap ordering
+                if pole_dist_feature1 > pole_dist_feature0:
+                    # Need to swap
+                    tri_features[idx][6] = tri_features[idx][3]
+                    tri_features[idx][7] = tri_features[idx][4]
+                    tri_features[idx][8] = tri_features[idx][5]
+                    tri_features[idx][3] = a3
+                    tri_features[idx][4] = a4
+                    tri_features[idx][5] = a5
+                    tri_features[idx][9] = pole_dist_feature1
+                    tri_features[idx][10] = pole_dist_feature0
+
+                    tri_adjacency[idx][4] = tri_adjacency[idx][1]
+                    tri_adjacency[idx][5] = tri_adjacency[idx][2]
+                    tri_adjacency[idx][6] = tri_adjacency[idx][3]
+                    tri_adjacency[idx][1] = tri_to_str([pole, v0, v1])
+                    tri_adjacency[idx][2] = tri_to_str([pole, v1, v2])
+                    tri_adjacency[idx][3] = tri_to_str([pole, v2, v0])
+
+                else:
+                    # Just need to set zero values
+                    tri_features[idx][6] = a3
+                    tri_features[idx][7] = a4
+                    tri_features[idx][8] = a5
+                    tri_features[idx][10] = pole_dist_feature1
+
+                    tri_adjacency[idx][4] = tri_to_str([pole, v0, v1])
+                    tri_adjacency[idx][5] = tri_to_str([pole, v1, v2])
+                    tri_adjacency[idx][6] = tri_to_str([pole, v2, v0])
+
+    # Create idx based adjacency
+    tri_adjacency_idx = [
+        [str_to_idx(tri_adjacency[i][j]) for j in range(len(tri_adjacency[0]))]
+        for i in range(len(tri_adjacency))
+    ]
+
+    # Save adjacency and features as tensors
+    features = torch.FloatTensor(tri_features)
+    adjacency = torch.IntTensor(tri_adjacency_idx)
+
+    mesh_id = mesh_file[-8:-4]
+    torch.save(features, output_folder + "/" + mesh_id + "f.pt")
+    torch.save(adjacency, output_folder + "/" + mesh_id + "a.pt")
+
+    end = time.time()
+    print("Mesh: " + str(mesh_id) +
+          " Features:" + str(features.shape) +
+          " Adjacency:" + str(adjacency.shape) +
+          " Time:" + str(end-start)[0:6])
+
+    # Sanity checks
+    '''
+    print(len(tri_seen))
+    print(np.array(tri_features).shape)
+    print(np.array(tri_adjacency).shape)
+    print(np.array(tri_adjacency_idx).shape)
+    print(tri_adjacency[0:10])
+    print(tri_adjacency_idx[0:10])
+    def check(tri_str):
+        if tri_str == "x":
+            return 1
+        s = 0
+        t = str_to_tri(tri_str)
+        for p in set(permutations(t)):
+            tri_str = tri_to_str(p)
+            if tri_str in tri_idx_map:
+                s += 1
+        if s > 1:
+            print(tri_str)
+        return s
+    checker = [
+        [check(tri_adjacency[i][j]) for j in range(len(tri_adjacency[0]))]
+        for i in range(len(tri_adjacency))
+    ]
+    print(np.sum(checker) / 7)
+    '''
+
+def assemble_example(feature_file, adjacency_file, padded_output_folder, max_faces = 9000):
     """
-    Calculates all angles of the triangle (a, b, c)
-    :param a: vertex1 (x, y, z)
-    :param b: vertex2 (x, y, z)
-    :param c: vertex3 (x, y, z)
-    :return: angle_a, angle_b, angle_c
+    Assembles a fully processed mesh example from the features and adjacency datastructures
+    defined above. Creates a [max_faces, 7, 12] tensor, pads max_faces - #faces zeros to
+    the tensor. For meshes with more than max_faces faces, does nothing.
+
+    :param feature_file: file containing the features datastructure.
+    :param adjacency_file: file containing the adjacency datastructure.
+    :param padded_output_folder: folder to write output.
+    :param max_faces: How many faces to pad each tensor to.
+    :return:
     """
+    start = time.time()
 
-    return tri_calc_angle(a, b, c), tri_calc_angle(b, a, c), tri_calc_angle(c, a, b)
+    features = torch.load(feature_file)
+    num_faces = features.shape[0]
 
-def tri_calc_angle(a, b, c):
+    # Disregard meshes with greater than max_faces number of faces
+    if num_faces > max_faces:
+        return
+
+    adjacencies = torch.load(adjacency_file)
+    mesh_idx = feature_file[-9:-4]
+    padded_features = torch.zeros(max_faces, 7, 12)
+    padded_adjacencies = -torch.ones(max_faces, 7)
+
+    # For each face assemble neighbours features
+    for row_idx in range(num_faces):
+        adjacency = adjacencies[row_idx]
+
+        neighbourhood = []
+        for tri_idx in adjacency:
+            tri_idx = tri_idx.numpy()
+            if tri_idx == -1:
+                neighbourhood.append(np.array([0] * 12))
+            else:
+                neighbourhood.append(features[tri_idx].numpy())
+
+        neighbourhood = torch.Tensor(neighbourhood)
+        neighbourhood = torch.unsqueeze(neighbourhood, dim=0)
+        padded_features[row_idx] = neighbourhood
+
+    # Pad adjacencies
+    padded_adjacencies[0:num_faces, :] = adjacencies
+
+    # save padded example
+    torch.save(padded_features, padded_output_folder + "/" + str(mesh_idx) + ".pt")
+
+
+    # save padded adjacencies
+    torch.save(padded_adjacencies, padded_output_folder + "/" + str(mesh_idx) + "a.pt")
+
+    end = time.time()
+    print("Padded mesh " + str(mesh_idx) +
+          " with " + str(max_faces - num_faces) +
+          " faces in " + str(end - start)[0:6])
+
+def pad_adjacencies():
+    max_faces = 9000
+    output_folder = "./data/processed_data"
+    padded_folder = "./data/padded_data"
+    adjacency_files = [join(output_folder, f) for f in listdir(output_folder)
+                       if (isfile(join(output_folder, f)) and f[-4:] == "a.pt")]
+
+    for adjacency_file in adjacency_files:
+        adjacency = torch.load(adjacency_file)
+        num_faces = adjacency.shape[0]
+        if num_faces > max_faces:
+            continue
+        padded_adjacency = -torch.ones(max_faces, 7)
+        padded_adjacency[0:num_faces, :] = adjacency
+        mesh_idx = adjacency_file[-9:-4]
+        torch.save(padded_adjacency, padded_folder + "/" + str(mesh_idx) + "a.pt")
+        print(mesh_idx)
+
+# Calculates distance from triangle's plane to a point
+def calc_point_tri_distance(point, tri, verts):
+    p = verts[point]
+    v0, v1, v2 = verts[tri[0]], verts[tri[1]], verts[tri[2]]
+    t1 = v1 - v0
+    t2 = v2 - v0
+    p = p - v0
+    n = np.cross(t1, t2)
+    n /= np.linalg.norm(n)
+
+    return abs(np.dot(n, p))
+
+# Calculates angles of triangle tri, and returns vertices and angles
+# in order of largest to smallest angle.
+def calc_ordered_angles(tri, verts):
+    v0 = tri[0]
+    v1 = tri[1]
+    v2 = tri[2]
+    a0 = calc_angle_in_tri(verts[v0], verts[v1], verts[v2])
+    a1 = calc_angle_in_tri(verts[v1], verts[v0], verts[v2])
+    a2 = calc_angle_in_tri(verts[v2], verts[v0], verts[v1])
+
+    ordering = np.argsort(np.array([a0, a1, a2]))[::-1]
+
+    v0, v1, v2 = np.array([v0, v1, v2])[ordering]
+    a0, a1, a2 = np.array([a0, a1, a2])[ordering]
+
+    return v0, v1, v2, a0, a1, a2
+
+def calc_angle_in_tri(a, b, c):
     """
     Calculates angle corresponding to vertex a in the triangle in radians.
     From https://www.geeksforgeeks.org/find-all-angles-of-a-triangle-in-3d/.
@@ -240,7 +358,7 @@ def tri_calc_angle(a, b, c):
 
     return math.acos(num / den)
 
-def tri_calc_area(a, b, c):
+def calc_tri_area(a, b, c):
     """
     Calculates the area of the triangle from the position of its vertices.
     :param a: vertex1 (x, y, z)
@@ -248,69 +366,11 @@ def tri_calc_area(a, b, c):
     :param c: vertex3 (x, y, z)
     :return: float area of the triangle.
     """
-    l1 = dist(a, b)
-    l2 = dist(a, c)
-    l3 = dist(b, c)
-    p = (l1 + l2 + l3) / 2
+    a_ = dist(a, b)
+    b_ = dist(a, c)
+    c_ = dist(b, c)
 
-    return math.sqrt(p * (p-l1) * (p-l2) * (p-l3))
-
-def get_triangles_and_index(tets):
-    """
-    Given the tets in a tet mesh, returns a list of all triangles in the mesh.
-    Additionaly creates a dictionary that indexes each triangle with its two coincident tets. Tri's on the surface
-    of the mesh will have -1 to indicate no second tet, ie: {tri_id: [tet_idx0, -1]}
-    :param tets: numpy ndarray of size (# tets, 4) containing all tets in the mesh.
-    :return: numpy ndarray of size (# triangles, 3) and dictionary of form {tri_id: [tet_idx0, tet_idx1]} for all tris
-    """
-    # String representations of final triangles, ie: (1, 2, 3) = "1.2.3"
-    tri_ids = []
-    # Dictionary will contain 2 tets for each triangle
-    tri_tet_dict = {}
-
-    # Indices into each tet to get 4 composite triangles
-    i0 = [0, 1, 2]
-    i1 = [0, 2, 3]
-    i2 = [0, 3, 1]
-    i3 = [3, 2, 1]
-
-    for tet_idx in range(len(tets)):
-        tet = tets[tet_idx]
-
-        # Get 4 composite triangles from the tet
-        tris = [tet[i0], tet[i1], tet[i2], tet[i3]]
-
-        for tri in tris:
-            # Check that this triangle has not already been seen
-            new_tri = True
-            for perm in set(permutations((tri))):
-                tri_id = triangle_to_id(perm)
-                if tri_id in tri_ids:
-                    new_tri = False
-                    break
-
-            if new_tri:
-                tri_ids.append(tri_id)
-                tri_tet_dict[tri_id] = [tet_idx, -1]
-            else:
-                tri_tet_dict[tri_id][1] = tet_idx
-
-    # Convert triangle ids back to triangles
-    tris = [id_to_triangle(tri_id) for tri_id in tri_ids]
-
-    return np.array(tris), tri_tet_dict
-
-def triangle_to_id(tri):
-    return "{}.{}.{}".format(tri[0], tri[1], tri[2])
-
-def id_to_triangle(id):
-    return [int(num) for num in re.findall('(\d+)\.(\d+)\.(\d+)', id)[0]]
-
-def dist_sqr(a, b):
-    x = a[0] - b[0]
-    y = a[1] - b[1]
-    z = a[2] - b[2]
-    return x*x + y*y + z*z
+    return 0.25 * math.sqrt((a_ + b_ + c_)*(-a_ + b_ + c_)*(a_ - b_ + c_)*(a_ + b_ - c_))
 
 def dist(a, b):
     x = a[0] - b[0]
@@ -318,71 +378,33 @@ def dist(a, b):
     z = a[2] - b[2]
     return math.sqrt(x*x + y*y + z*z)
 
-def plot_vertices(points):
-    fig = figure()
-    ax = Axes3D(fig)
+data_folder = "./data/Thingi10k/raw"
+output_folder = "./data/Thingi10k/processed_data"
+padded_folder = "./data/Thingi10k/padded_data"
+meshes = [join(data_folder, f) for f in listdir(data_folder) if (isfile(join(data_folder, f)) and f[-4:] == ".msh")]
 
-    points = np.vstack([points, points[0]])
-    ax.plot(points[:,0], points[:,1], points[:,2])
+process = False
+assemble = True
 
-    for i in range(len(points)-1):
-        ax.text(points[i, 0], points[i, 1], points[i, 2], '%s' % (str(i)), size=20, zorder=1, color='k')
+if process:
+    for mesh in meshes:
+        process_mesh(mesh, output_folder)
 
-    plt.show()
+faces = []
+if assemble:
+    feature_files = [join(output_folder, f) for f in listdir(output_folder)
+                        if (isfile(join(output_folder, f)) and f[-4:] == "f.pt")]
+    adjacency_files = [join(output_folder, f) for f in listdir(output_folder)
+                        if (isfile(join(output_folder, f)) and f[-4:] == "a.pt")]
 
-def plot_histogram_num_faces(processed_data_folder):
-    num_faces = []
-    cached_sizes_file = join(processed_data_folder, "sizes.pt")
-    if isfile(cached_sizes_file):
-        num_faces = torch.load(cached_sizes_file).tolist()
-    else:
-        tensor_files = [join(processed_data_folder, f) for f in listdir(processed_data_folder)
-                        if (isfile(join(processed_data_folder, f)) and f[-3:] == ".pt")]
-        num_faces = [torch.load(f).shape[0] for f in tensor_files]
-        sizes = torch.from_numpy(np.array(num_faces))
-        torch.save(sizes, processed_data_folder + "\\" + "sizes.pt")
+    for i in range(len(feature_files)):
+        feature_file = feature_files[i]
+        adjacency_file = adjacency_files[i]
 
-    fig, hist_plot = plt.subplots(1, 1)
-    hist_plot.hist(num_faces, 20)
-    hist_plot.set_ylabel("Frequency")
-    hist_plot.set_xlabel("Number of Faces")
-    hist_plot.set_title("Histogram of Number of Mesh Faces")
+        #features = torch.load(feature_file)
+        #faces.append(features.shape[0])
+        assemble_example(feature_file, adjacency_file, padded_folder, max_faces=14000)
 
-    plt.show()
-
-if __name__ == "__main__":
-    # Demo for a single mesh
-    if False:
-        # Read in mesh
-        verts, tets = igl.read_msh("./data/00001.msh")
-
-        # Find all triangles in the mesh and index tets by these triangles
-        tris, tri_tet_dict = get_triangles_and_index(tets)
-
-        # Calculate features defined per triangle face in the mesh
-        start = time.time()
-        features = calculate_element_features(tris, verts, tets, tri_tet_dict)
-        end = time.time()
-        print("Processing time for mesh 0:")
-        print(end-start)
-        print("Output shape for mesh 0:")
-        print(features.shape)
-
-    # Initally process all .msh files in the data_folder and save all processed meshes in the output_folder
-    data_folder = '.\\data'
-    output_folder = '.\\data\\processed_data'
-    if False:
-        # Get all .msh files
-        meshes = [join(data_folder, f) for f in listdir(data_folder) if (isfile(join(data_folder, f)) and f[-4:] == ".msh")]
-
-        # Preprocess all .msh files into (# faces by 7 by 11) patch tensors and saves them
-        preprocess_meshes(meshes, output_folder)
-
-    # Histogram to see distribution of # of faces in all meshes
-    # plot_histogram_num_faces(output_folder)
-
-    # Filters tensors by:
-    # 1) Removing all meshs with more than 9,000 faces
-    # 2) Padding all meshes to be (9,000 by 7 by 11)
-    # 3) Normalize the mesh features.
-    filter_preprocessed_meshes(output_folder)
+#print(max(faces))
+#plt.hist(faces)
+#plt.show()

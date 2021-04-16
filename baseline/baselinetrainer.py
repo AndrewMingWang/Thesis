@@ -1,5 +1,5 @@
-from datasets import *
-from models import *
+from baselinedatasets import *
+from baselinemodels import *
 
 import torch
 import torch.nn as nn
@@ -7,46 +7,23 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 import matplotlib.pyplot as plt
-import pickle
 from matplotlib.ticker import MaxNLocator
 
 def train_model():
     # Save run data to dir
-    output_dir = "./output/FaceBased/" +"MNIST" #+"MNIST" +"MNIST_01" +"MNIST_27"
+    output_dir = "../output/Baseline/" + "MNIST"  # +"MNIST" +"MNIST_01" +"MNIST_27"
 
-    # Specify device
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    binary = False
-    label0 = 2
-    label1 = 7
-    thingi10k = False
-    data, model = None, None
+    #voxelized_data_folder = "../data/Thingi10k/baseline_data/voxelized"
+    #labels_file = "../data/Thingi10k/output.pkl"
+    voxelized_data_folder = "../data/MNIST/baseline_data/voxelized"
+    labels_file = "../data/MNIST/label.txt"
 
     # Create dataset
-    if thingi10k:
-        data = Thingi10kProcessedMeshDataset("./data/Thingi10k/padded_data",
-                                             "./data/Thingi10k/padded_data",
-                                             "./data/Thingi10k/output.pkl")
-    else:
-        if binary:
-            data = MNISTBinaryProcessedMeshDataset("./data/MNIST/padded_data",
-                                                   "./data/MNIST/padded_data",
-                                                   "./data/MNIST/label.txt",
-                                                   label0=label0 , label1=label1)
-        else:
-            data = MNISTProcessedMeshDataset("./data/MNIST/padded_data",
-                                             "./data/MNIST/padded_data",
-                                             "./data/MNIST/label.txt")
-
-    # Specifiy model
-    num_faces = 14000 if thingi10k else 9000
-    num_classes = 2 if binary else 10
-    model = CNN(num_kernels=5, num_classes=num_classes, device=device, num_faces=num_faces)
-    model.to(device)
+    # data = BinaryVoxelDataset(voxelized_data_folder, labels_file, label0=0, label1=1)
+    # data = BinaryVoxelDataset(voxelized_data_folder, labels_file, label0=2, label1=7)
+    data = VoxelDataset(voxelized_data_folder, labels_file)
 
     print("Dataset created, number of points: " + str(len(data)))
-    print("Number of adjacencies loaded: " + str(len(data.adjacency_dict)))
     print("Class counts:")
     print(data.class_counts)
 
@@ -65,6 +42,13 @@ def train_model():
     train_loader = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=4)
     val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, num_workers=4)
 
+    # Specify device
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # Specify model
+    model = BaselineCNN(num_kernels=5, num_classes=10)
+    model.to(device)
+
     # Specify loss function
     criterion = nn.CrossEntropyLoss()
 
@@ -77,10 +61,6 @@ def train_model():
     val_losses = []
     val_accuracies = []
 
-    # track correct and incorrect values
-    correct = -np.ones(num_val_samples)
-    incorrect = -np.ones(num_val_samples)
-
     for epoch in range(num_epochs):
         train_loss_this_epoch = 0
         train_correct_this_epoch = 0
@@ -89,57 +69,36 @@ def train_model():
 
         # Training
         for train_samples, train_labels in train_loader:
-            labels = train_labels[0]
-            features = train_samples[0]
-            adjacencies = train_samples[1]
-
-            labels, features, adjacencies = \
-                labels.to(device), features.to(device), adjacencies.to(device)
+            train_samples, train_labels = train_samples.to(device), train_labels.to(device)
 
             optimizer.zero_grad()
 
-            out = model(features, adjacencies)
+            out = model(train_samples)
 
-            loss = criterion(out, labels)
+            loss = criterion(out, train_labels)
 
             loss.backward()
 
             optimizer.step()
 
             train_loss_this_epoch += loss.cpu().detach().numpy()
-            train_correct_this_epoch += calc_num_correct(out, labels)
+            correct_this_batch,_,_ = calc_num_correct(out, train_labels)
+            train_correct_this_epoch += correct_this_batch
 
         # Validation
         with torch.no_grad():
-            batch = 0
             for val_samples, val_labels in val_loader:
-                labels = val_labels[0]
-                indices = val_labels[1].numpy()
-                features = val_samples[0]
-                adjacencies = val_samples[1]
-
-                labels, features, adjacencies = \
-                    labels.to(device), features.to(device), adjacencies.to(device)
+                val_samples, val_labels = val_samples.to(device), val_labels.to(device)
 
                 # Compute output for validation examples
-                out = model(features, adjacencies)
+                out = model(val_samples)
 
                 # Compute loss
-                loss = criterion(out, labels)
+                loss = criterion(out, val_labels)
+
                 val_loss_this_epoch += loss.cpu().detach().numpy()
-
-                # Compute accuracy
-                correct_this_batch = calc_num_correct(out, labels)
+                correct_this_batch, correct_indices, incorrect_indices = calc_num_correct(out, val_labels)
                 val_correct_this_epoch += correct_this_batch
-
-                # On the last epoch, get indices of correct and incorrect predictions
-                if epoch == num_epochs-1:
-                    correct_this_batch, correct_indices, incorrect_indices = calc_num_correct_with_indices(out, labels)
-                    correct_indices = indices[correct_indices]
-                    incorrect_indices = indices[incorrect_indices]
-                    correct[batch*batch_size:batch*batch_size + len(correct_indices)] = correct_indices
-                    incorrect[batch*batch_size:batch*batch_size + len(incorrect_indices)] = incorrect_indices
-                    batch += 1
 
         print("Epoch " + str(epoch) + ":")
         print("Train loss: " + str(train_loss_this_epoch / num_train_samples))
@@ -152,16 +111,7 @@ def train_model():
         val_losses.append(val_loss_this_epoch / num_val_samples)
         val_accuracies.append(val_correct_this_epoch / num_val_samples)
 
-    print("Max Train acc: " + str(max(train_accuracies)))
-    print("at: " + str(np.argmax(train_accuracies)))
-    print("Max Validation acc: " + str(max(val_accuracies)))
-    print("at: " + str(np.argmax(val_accuracies)))
-
     # Save results to output dir
-    with open(output_dir + "/correct.pkl", 'wb') as file:
-        pickle.dump(correct, file, protocol=pickle.HIGHEST_PROTOCOL)
-    with open(output_dir + "/incorrect.pkl", 'wb') as file:
-        pickle.dump(incorrect, file, protocol=pickle.HIGHEST_PROTOCOL)
     file = open(output_dir + "/res.txt", "w")
     file.write(str(train_accuracies[-1]) + "\n")
     file.write(str(max(train_accuracies)) + "\n")
@@ -176,16 +126,9 @@ def train_model():
 def calc_num_correct(pred, labels):
     pred, labels = pred.cpu(), labels.cpu()
     pred_argmax = torch.argmax(pred, dim=1)
-    return torch.sum((torch.eq(pred_argmax, labels))).item()
+    correct_array = torch.eq(pred_argmax, labels)
 
-def calc_num_correct_with_indices(pred, labels):
-    pred, labels = pred.cpu(), labels.cpu()
-    pred_argmax = torch.argmax(pred, dim=1)
-    correct_array = torch.eq(pred_argmax, labels).cpu().numpy()
-    correct_indices = np.where(correct_array == 1)
-    incorrect_indices = np.where(correct_array == 0)
-
-    return np.sum(correct_array), correct_indices, incorrect_indices
+    return torch.sum(correct_array).item(), 0, 0
 
 def plot_results(train_losses, train_accuracies, val_losses, val_accuracies, num_epochs, output_dir):
     # Plotting
